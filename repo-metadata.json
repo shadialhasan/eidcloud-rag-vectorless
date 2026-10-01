@@ -1,0 +1,12 @@
+{
+  "description": "Vectorless RAG engine using hierarchical document graphs, BM25, and structural citations in pure PHP",
+  "topics": [
+    "eidcloud",
+    "rag",
+    "vectorless-rag",
+    "bm25",
+    "document-search",
+    "llm-context",
+    "php8"
+  ]
+}

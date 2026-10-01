@@ -1,0 +1,201 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Pure zero-vendor PSR-4 style autoloader
+spl_autoload_register(function (string $class) {
+    $prefix = 'EidCloud\\RagVectorless\\';
+    $baseDir = dirname(__DIR__) . '/src/';
+
+    $len = strlen($prefix);
+    if (strncmp($prefix, $class, $len) !== 0) {
+        return;
+    }
+
+    $relativeClass = substr($class, $len);
+    $file = $baseDir . str_replace('\\', '/', $relativeClass) . '.php';
+
+    if (file_exists($file)) {
+        require_once $file;
+    }
+});
+
+use EidCloud\RagVectorless\RagEngine;
+
+function printHelp(): void
+{
+    echo <<<HELP
+\033[1;36meidcloud-rag\033[0m - Ultra-fast, Zero-Cloud-Cost Vectorless RAG Engine (v1.0.0)
+
+\033[1;33mUSAGE:\033[0m
+  php bin/eidcloud-rag <command> [arguments] [options]
+
+\033[1;33mCOMMANDS:\033[0m
+  \033[1;32mindex\033[0m <directory|file>   Index document(s) into persistent SQLite/JSON or memory
+  \033[1;32mask\033[0m   <query>            Search and assemble context with citations for LLM prompts
+
+\033[1;33mOPTIONS:\033[0m
+  \033[0;32m--db=<path>\033[0m            Database path (.sqlite or .json) [default: rag.sqlite]
+  \033[0;32m--top=<n>\033[0m              Number of top matches to retrieve [default: 3]
+  \033[0;32m--citations\033[0m            Display exact file, line number, and topology citations
+  \033[0;32m--tag=<tag>\033[0m            Filter by metadata tag
+  \033[0;32m--json\033[0m                 Output clean JSON for AI agent context injection
+  \033[0;32m-h, --help\033[0m             Show this help screen
+
+\033[1;33mEXAMPLES:\033[0m
+  php bin/eidcloud-rag index ./docs/ --db=rag.sqlite
+  php bin/eidcloud-rag ask "How does authentication work?" --top=3 --citations
+  php bin/eidcloud-rag ask "Database migration instructions" --json
+
+HELP;
+}
+
+$args = array_slice($argv, 1);
+
+if (empty($args) || in_array('-h', $args, true) || in_array('--help', $args, true)) {
+    printHelp();
+    exit(0);
+}
+
+$command = $args[0];
+$params = [];
+$flags = [];
+
+for ($i = 1; $i < count($args); $i++) {
+    $arg = $args[$i];
+    if (str_starts_with($arg, '--')) {
+        $clean = substr($arg, 2);
+        if (str_contains($clean, '=')) {
+            [$k, $v] = explode('=', $clean, 2);
+            $flags[$k] = $v;
+        } else {
+            $flags[$clean] = true;
+        }
+    } else {
+        $params[] = $arg;
+    }
+}
+
+$dbPath = $flags['db'] ?? 'rag.sqlite';
+$topK = isset($flags['top']) ? (int)$flags['top'] : 3;
+$isJson = isset($flags['json']);
+$withCitations = isset($flags['citations']);
+$tagFilter = $flags['tag'] ?? null;
+
+$filters = [];
+if ($tagFilter !== null) {
+    $filters['tag'] = $tagFilter;
+}
+
+// Instantiate engine
+$engine = str_ends_with($dbPath, '.json')
+    ? RagEngine::createWithJson($dbPath)
+    : RagEngine::createWithSqlite($dbPath);
+
+switch ($command) {
+    case 'index':
+        if (empty($params)) {
+            fwrite(STDERR, "Error: missing target directory or file to index.\nRun 'php bin/eidcloud-rag --help' for usage.\n");
+            exit(1);
+        }
+
+        $target = $params[0];
+        if (!file_exists($target)) {
+            fwrite(STDERR, "Error: Target '{$target}' does not exist.\n");
+            exit(1);
+        }
+
+        if (is_dir($target)) {
+            $stats = $engine->indexDirectory($target);
+            if ($isJson) {
+                echo json_encode([
+                    'status' => 'success',
+                    'target' => $target,
+                    'database' => $dbPath,
+                    'files_indexed' => $stats['files_indexed'],
+                    'nodes_created' => $stats['nodes_created'],
+                    'duration_ms' => $stats['duration_ms'],
+                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            } else {
+                echo "\033[1;32m[SUCCESS]\033[0m Indexed directory: {$target}\n";
+                echo "  • Files indexed : {$stats['files_indexed']}\n";
+                echo "  • Chunks created: {$stats['nodes_created']}\n";
+                echo "  • Duration      : {$stats['duration_ms']} ms\n";
+                echo "  • Database      : {$dbPath}\n";
+            }
+        } else {
+            $startTime = microtime(true);
+            $nodes = $engine->indexFile($target);
+            $engine->persist();
+            $duration = round((microtime(true) - $startTime) * 1000, 2);
+
+            if ($isJson) {
+                echo json_encode([
+                    'status' => 'success',
+                    'target' => $target,
+                    'database' => $dbPath,
+                    'nodes_created' => count($nodes),
+                    'duration_ms' => $duration,
+                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            } else {
+                echo "\033[1;32m[SUCCESS]\033[0m Indexed single file: {$target}\n";
+                echo "  • Chunks created: " . count($nodes) . "\n";
+                echo "  • Duration      : {$duration} ms\n";
+                echo "  • Database      : {$dbPath}\n";
+            }
+        }
+        break;
+
+    case 'ask':
+    case 'search':
+        if (empty($params)) {
+            fwrite(STDERR, "Error: missing query string.\nRun 'php bin/eidcloud-rag --help' for usage.\n");
+            exit(1);
+        }
+
+        $query = implode(' ', $params);
+        $context = $engine->ask($query, $topK, $filters);
+
+        if ($isJson) {
+            $serializableResults = array_map(fn($r) => $r->toArray(), $context['results']);
+            echo json_encode([
+                'query' => $query,
+                'total_results' => count($context['results']),
+                'citations' => $context['citations'],
+                'context_text' => $context['context_text'],
+                'results' => $serializableResults,
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
+            break;
+        }
+
+        echo "\033[1;36mQuery:\033[0m {$query}\n";
+        echo "\033[1;33mResults:\033[0m " . count($context['results']) . " match(es) retrieved\n";
+        echo str_repeat('-', 60) . "\n";
+
+        if (empty($context['results'])) {
+            echo "No matching context found.\n";
+            break;
+        }
+
+        foreach ($context['results'] as $idx => $result) {
+            $node = $result->node;
+            $num = $idx + 1;
+            echo "\033[1;32m[#{$num}] Score:\033[0m " . round($result->score, 4) . "\n";
+            echo "\033[1;34mCitation:\033[0m " . $result->getCitation() . "\n";
+            echo "\033[1;37mContent:\033[0m\n" . trim($node->content) . "\n\n";
+        }
+
+        if ($withCitations) {
+            echo "\033[1;35m--- EXACT CITATIONS LIST ---\033[0m\n";
+            foreach ($context['citations'] as $c) {
+                echo " • {$c}\n";
+            }
+            echo "\n";
+        }
+        break;
+
+    default:
+        fwrite(STDERR, "Unknown command '{$command}'. Run 'php bin/eidcloud-rag --help' for usage.\n");
+        exit(1);
+}
